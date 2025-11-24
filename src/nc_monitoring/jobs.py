@@ -4,6 +4,7 @@ from apscheduler.schedulers.base import BaseScheduler
 
 from checks.version_by_zone import run_version_zone_check
 from checks.screenshot_health import run_screenshot_health
+from checks.anydesk_check import run_anydesk_check
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +46,22 @@ def job_version_sheet_check() -> None:
 
 
 def job_anydesk_check() -> None:
-    """TEMP: placeholder for AnyDesk connectivity check."""
-    logger.info("[job_anydesk_check] Running (placeholder, no real logic yet).")
+    """
+    Real job: call the AnyDesk connectivity check.
+
+    This uses:
+      - APIClient       (in clients.api_client)
+      - AnyDeskClient   (in clients.anydesk_client)
+
+    IMPORTANT:
+      This should run ONLY on a Windows agent with:
+        - AnyDesk installed and on PATH
+        - An active desktop session
+        - Tesseract configured for pytesseract
+    """
+    logger.info("[job_anydesk_check] Starting AnyDesk connectivity check...")
+    run_anydesk_check()
+    logger.info("[job_anydesk_check] Finished.")
 
 
 # --- Job registration --------------------------------------------------------
@@ -57,8 +72,8 @@ def register_jobs(scheduler: BaseScheduler, *, is_anydesk_agent: bool) -> None:
     Register all recurring jobs on the given scheduler.
 
     Right now:
-      - screenshot + version_zone jobs are fully implemented
-      - version_sheet + anydesk jobs are placeholders
+      - screenshot + version_zone + anydesk jobs are fully implemented
+      - version_sheet job is a placeholder
     """
 
     logger.info("Registering jobs (ANYDESK_AGENT=%s)", is_anydesk_agent)
@@ -90,7 +105,7 @@ def register_jobs(scheduler: BaseScheduler, *, is_anydesk_agent: bool) -> None:
         replace_existing=True,
     )
 
-    # AnyDesk: will be real later, only on Windows agent
+    # AnyDesk: only when acting as Windows agent
     if is_anydesk_agent:
         scheduler.add_job(
             job_anydesk_check,

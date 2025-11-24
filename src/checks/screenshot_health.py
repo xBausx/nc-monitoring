@@ -1,11 +1,16 @@
 import logging
+import os
+import re
 from datetime import datetime, time, timedelta
 from io import BytesIO
 from typing import Any, Dict, List, Optional
+from pathlib import Path
 
+import gspread
+import pytesseract
 import pytz
 import requests
-import pytesseract
+from google.oauth2.service_account import Credentials
 from PIL import Image
 
 from clients.api_client import APIClient
@@ -25,6 +30,25 @@ ERROR_MESSAGES = {
     "updates are available",
     "downloading updates",
 }
+
+# Configure pytesseract to use TESSERACT_CMD if provided, or fall back to
+# the repo-local Tesseract-OCR\tesseract.exe path.
+TESSERACT_CMD = os.getenv("TESSERACT_CMD")
+
+if not TESSERACT_CMD:
+    # Try to auto-detect the bundled Tesseract in the repo:
+    # <repo_root>/Tesseract-OCR/tesseract.exe
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+        candidate = repo_root / "Tesseract-OCR" / "tesseract.exe"
+        if candidate.exists():
+            TESSERACT_CMD = str(candidate)
+    except Exception:
+        # Best effort only; we'll fall back to default search if this fails.
+        pass
+
+if TESSERACT_CMD:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 
 # --------------------------------------------------------------------------- #
@@ -222,13 +246,91 @@ def load_image_from_url(url: str) -> Optional[Image.Image]:
         return None
 
 
+def _reorder_monitoring_tabs_for_today(today_tab_name: str) -> None:
+    """
+    Reorder worksheets in the monitoring spreadsheet to match this layout:
+
+        [ TODAY ] [ Pacific ] [ Eastern ] [ Central ] [ Mountain ]
+        [ AnyDesk Status ] [ older daily tabs... ] [others]
+
+    - "Daily" tabs are ones named like YYYY-MM-DD.
+    - We don't delete anything; we just reorder.
+    """
+    spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID")
+    credentials_file = os.getenv("SHEETS_CREDENTIALS_FILE")
+
+    if not spreadsheet_id or not credentials_file:
+        logger.warning(
+            "Cannot reorder tabs: SHEETS_SPREADSHEET_ID or SHEETS_CREDENTIALS_FILE not set."
+        )
+        return
+
+    try:
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_file(credentials_file, scopes=scopes)
+        client = gspread.authorize(creds)
+        sh = client.open_by_key(spreadsheet_id)
+    except Exception as e:
+        logger.error("Failed to initialize gspread for tab reordering: %s", e)
+        return
+
+    try:
+        worksheets = sh.worksheets()
+    except Exception as e:
+        logger.error("Failed to fetch worksheets for tab reordering: %s", e)
+        return
+
+    name_to_ws = {ws.title: ws for ws in worksheets}
+    ordered: List[Any] = []
+
+    def add_if_present(name: str) -> None:
+        ws = name_to_ws.get(name)
+        if ws and ws not in ordered:
+            ordered.append(ws)
+
+    # 1) Today first
+    add_if_present(today_tab_name)
+
+    # 2) Fixed zone tabs in your preferred order
+    for zone_name in ["Pacific", "Eastern", "Central", "Mountain"]:
+        add_if_present(zone_name)
+
+    # 3) AnyDesk Status tab
+    add_if_present("AnyDesk Status")
+
+    # 4) All other date-like tabs (YYYY-MM-DD), newest -> oldest, excluding today's
+    daily_tabs = [
+        ws
+        for ws in worksheets
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", ws.title)
+        and ws.title != today_tab_name
+    ]
+    daily_tabs_sorted = sorted(daily_tabs, key=lambda ws: ws.title, reverse=True)
+    for ws in daily_tabs_sorted:
+        if ws not in ordered:
+            ordered.append(ws)
+
+    # 5) Any remaining worksheets (e.g., Test, Offline 6-30 Days, etc.)
+    for ws in worksheets:
+        if ws not in ordered:
+            ordered.append(ws)
+
+    try:
+        sh.reorder_worksheets(ordered)
+        logger.info(
+            "Reordered monitoring worksheets: %s",
+            [ws.title for ws in ordered],
+        )
+    except Exception as e:
+        logger.error("Failed to reorder worksheets: %s", e)
+
+
 # --------------------------------------------------------------------------- #
 # Main check
 # --------------------------------------------------------------------------- #
 
 def _process_license(
     api: APIClient,
-    sheets: SheetsClient,
     ws,
     row_counter: int,
     license_data: Dict[str, Any],
@@ -258,11 +360,9 @@ def _process_license(
     if not screenshots_data:
         row_counter += 1
         logger.warning("No screenshots data for license %s.", license_key)
-        sheets.upsert_row(
-            ws,
-            key_value=row_counter,
-            values=[row_counter, license_key, "", "NO_SCREENSHOTS"],
-            key_col=1,
+        ws.append_row(
+            [row_counter, license_key, "", "NO_SCREENSHOTS"],
+            value_input_option="USER_ENTERED",
         )
         return row_counter
 
@@ -270,11 +370,9 @@ def _process_license(
     if not file_urls:
         row_counter += 1
         logger.warning("Empty 'files' list in screenshots for license %s.", license_key)
-        sheets.upsert_row(
-            ws,
-            key_value=row_counter,
-            values=[row_counter, license_key, "", "NO_SCREENSHOTS"],
-            key_col=1,
+        ws.append_row(
+            [row_counter, license_key, "", "NO_SCREENSHOTS"],
+            value_input_option="USER_ENTERED",
         )
         return row_counter
 
@@ -282,11 +380,9 @@ def _process_license(
     todays_urls = filter_screenshots_for_today(file_urls, timezone_name, license_key)
     if not todays_urls:
         row_counter += 1
-        sheets.upsert_row(
-            ws,
-            key_value=row_counter,
-            values=[row_counter, license_key, "", "SCREENSHOT_NAME_DATE_ERROR"],
-            key_col=1,
+        ws.append_row(
+            [row_counter, license_key, "", "SCREENSHOT_NAME_DATE_ERROR"],
+            value_input_option="USER_ENTERED",
         )
         return row_counter
 
@@ -302,18 +398,33 @@ def _process_license(
             black_screens += 1
             continue
 
-        text = pytesseract.image_to_string(img).strip().lower()
+        try:
+            text = pytesseract.image_to_string(img).strip().lower()
+        except pytesseract.TesseractNotFoundError as e:
+            logger.error(
+                "Tesseract not found while OCR-ing screenshot for license %s: %s",
+                license_key,
+                e,
+            )
+            # Can't classify this image, skip to next
+            continue
+        except Exception as e:
+            logger.error(
+                "Unexpected OCR error for license %s: %s",
+                license_key,
+                e,
+            )
+            continue
+
         if any(err in text for err in ERROR_MESSAGES):
             error_count += 1
 
     # Decide what to log
     if black_screens >= 3:
         row_counter += 1
-        sheets.upsert_row(
-            ws,
-            key_value=row_counter,
-            values=[row_counter, license_key, "", "OPEN_HOURS_BLACK_SCREENSHOTS"],
-            key_col=1,
+        ws.append_row(
+            [row_counter, license_key, "", "OPEN_HOURS_BLACK_SCREENSHOTS"],
+            value_input_option="USER_ENTERED",
         )
         logger.warning(
             "Black screen threshold exceeded for license %s (count=%s).",
@@ -322,11 +433,9 @@ def _process_license(
         )
     elif error_count >= 5:
         row_counter += 1
-        sheets.upsert_row(
-            ws,
-            key_value=row_counter,
-            values=[row_counter, license_key, "", "STUCK_ON_ERROR"],
-            key_col=1,
+        ws.append_row(
+            [row_counter, license_key, "", "STUCK_ON_ERROR"],
+            value_input_option="USER_ENTERED",
         )
         logger.warning(
             "Error screenshot threshold reached for license %s (count=%s).",
@@ -335,11 +444,9 @@ def _process_license(
         )
     elif 1 <= error_count <= 5:
         row_counter += 1
-        sheets.upsert_row(
-            ws,
-            key_value=row_counter,
-            values=[row_counter, license_key, "", "ERROR_DISPLAYED"],
-            key_col=1,
+        ws.append_row(
+            [row_counter, license_key, "", "ERROR_DISPLAYED"],
+            value_input_option="USER_ENTERED",
         )
         logger.info(
             "Error screenshots detected for license %s (count=%s).",
@@ -357,6 +464,7 @@ def run_screenshot_health() -> None:
       - Iterate through pages of licenses.
       - For each license, if store is open, analyze screenshots.
       - Record issues into a date-based sheet.
+      - Reorder tabs so today's sheet + fixed tabs are on the left.
     """
     logger.info("Starting screenshot health check...")
 
@@ -402,7 +510,7 @@ def run_screenshot_health() -> None:
 
         for lic in licenses:
             try:
-                row_counter = _process_license(api, sheets, ws, row_counter, lic)
+                row_counter = _process_license(api, ws, row_counter, lic)
             except Exception as e:
                 logger.error(
                     "Error while processing license %s: %s",
@@ -412,5 +520,8 @@ def run_screenshot_health() -> None:
                 )
 
         page += 1
+
+    # Reorder tabs so today's date sheet + fixed tabs are on the left
+    _reorder_monitoring_tabs_for_today(sheet_name)
 
     logger.info("Screenshot health check complete.")

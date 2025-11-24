@@ -9,6 +9,14 @@ import pygetwindow as gw
 import pytesseract
 from PIL import Image
 
+import os
+
+# Configure pytesseract to use TESSERACT_CMD env var if provided.
+TESSERACT_CMD = os.getenv("TESSERACT_CMD")
+if TESSERACT_CMD:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+    
+
 logger = logging.getLogger(__name__)
 
 

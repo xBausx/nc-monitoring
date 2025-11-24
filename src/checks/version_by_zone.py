@@ -24,17 +24,17 @@ PORTAL_LICENSE_URL = os.getenv(
 
 def _fetch_zone_licenses(api: APIClient, zone: str) -> List[Dict[str, Any]]:
     """
-    Fetch all licenses for a given timezone zone label using /api/license/getall
-    with simple pagination.
+    Fetch all online licenses for a given timezone/zone label using
+    /api/license/getall with pagination.
 
-    NOTE:
-        The exact filter params (timezoneName vs timezone, etc.) should be
-        adjusted to match the API contract. This version uses 'timezoneName'
-        as a query parameter and assumes the response has a 'licenses' list.
+    Notes:
+      - We use pageSize=100 (backend confirmed it's okay).
+      - We pass `timezone=zone` to match the real API param.
+      - We keep filters for active + assigned + online players.
     """
     licenses: List[Dict[str, Any]] = []
     page = 1
-    page_size = 100
+    page_size = 100  # backend confirmed this is OK
 
     logger.info("Fetching licenses for zone '%s'...", zone)
 
@@ -46,11 +46,15 @@ def _fetch_zone_licenses(api: APIClient, zone: str) -> List[Dict[str, Any]]:
             "sortColumn": "PiStatus",
             "sortOrder": "desc",
             "includeAdmin": "false",
-            # Filters – adjust if your API expects different names
+
+            # Filters – tweak if you need different behavior
             "piStatus": 1,          # online
             "active": "true",
             "assigned": "true",
-            "timezoneName": zone,
+            "online": "true",
+
+            # IMPORTANT: real param name is 'timezone'
+            "timezone": zone,
         }
 
         data = api.get_licenses(params=params)
