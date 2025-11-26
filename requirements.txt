@@ -1,0 +1,8 @@
+apscheduler
+gspread
+google-auth
+python-socketio[client]
+requests
+pillow
+pytesseract
+pytz
