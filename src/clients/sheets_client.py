@@ -145,3 +145,146 @@ class SheetsClient:
                 key_value,
             )
             ws.append_row(values, value_input_option="USER_ENTERED")
+    
+    def set_column_widths(
+        self,
+        ws,
+        start_col: int,
+        end_col: int,
+        pixel_size: int,
+    ) -> None:
+        """
+        Set the width (in pixels) for a range of columns in the given worksheet.
+
+        Columns are 1-based (A=1, B=2, ...), and end_col is inclusive.
+        This uses the low-level Google Sheets API via gspread's client.
+        """
+        # gspread Worksheet exposes the underlying sheetId as .id
+        try:
+            sheet_id = ws.id
+        except AttributeError:
+            sheet_id = ws._properties.get("sheetId")
+
+        if sheet_id is None:
+            logger.warning(
+                "Cannot set column widths for worksheet '%s': no sheetId.",
+                getattr(ws, "title", "<unknown>"),
+            )
+            return
+
+        # Google Sheets API uses 0-based indices, endIndex is exclusive
+        start_index = start_col - 1
+        end_index = end_col
+
+        body = {
+            "requests": [
+                {
+                    "updateDimensionProperties": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "COLUMNS",
+                            "startIndex": start_index,
+                            "endIndex": end_index,
+                        },
+                        "properties": {"pixelSize": pixel_size},
+                        "fields": "pixelSize",
+                    }
+                }
+            ]
+        }
+
+        try:
+            logger.info(
+                "Setting column widths for '%s' (cols %s-%s -> %spx)",
+                ws.title,
+                start_col,
+                end_col,
+                pixel_size,
+            )
+            client = self.spreadsheet.client
+            client.request(
+                "post",
+                f"https://sheets.googleapis.com/v4/spreadsheets/{self.spreadsheet.id}:batchUpdate",
+                json=body,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to set column widths for '%s': %s",
+                ws.title,
+                exc,
+            )
+
+    def set_horizontal_alignment(
+        self,
+        ws,
+        start_col: int,
+        end_col: int,
+        horizontal: str = "LEFT",
+    ) -> None:
+        """
+        Set horizontal alignment for a range of columns in the given worksheet.
+
+        Columns are 1-based (A=1, B=2, ...), end_col is inclusive.
+        Applies to all rows in those columns.
+        """
+        try:
+            sheet_id = ws.id
+        except AttributeError:
+            sheet_id = ws._properties.get("sheetId")
+
+        if sheet_id is None:
+            logger.warning(
+                "Cannot set alignment for worksheet '%s': no sheetId.",
+                getattr(ws, "title", "<unknown>"),
+            )
+            return
+
+        # 0-based indices for the API; endIndex is exclusive
+        start_col_index = start_col - 1
+        end_col_index = end_col
+
+        # Apply to all rows (0 .. row_count). row_count is usually large enough;
+        # worst case, this just covers more rows than currently used.
+        start_row_index = 0
+
+        body = {
+            "requests": [
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": start_row_index,
+                            "startColumnIndex": start_col_index,
+                            "endColumnIndex": end_col_index,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "horizontalAlignment": horizontal.upper(),
+                            }
+                        },
+                        "fields": "userEnteredFormat.horizontalAlignment",
+                    }
+                }
+            ]
+        }
+
+        try:
+            logger.info(
+                "Setting horizontal alignment=%s for '%s' (cols %s-%s)",
+                horizontal,
+                ws.title,
+                start_col,
+                end_col,
+            )
+            client = self.spreadsheet.client
+            client.request(
+                "post",
+                f"https://sheets.googleapis.com/v4/spreadsheets/{self.spreadsheet.id}:batchUpdate",
+                json=body,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to set alignment for '%s': %s",
+                ws.title,
+                exc,
+            )

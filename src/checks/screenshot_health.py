@@ -355,12 +355,12 @@ def _reorder_monitoring_tabs_for_today(today_tab_name: str) -> None:
     # 1) Today first
     add_if_present(today_tab_name)
 
-    # 2) AnyDesk Status tab
-    add_if_present("AnyDesk Status")
-    
-    # 3) Fixed zone tabs in your preferred order
+    # 2) Fixed zone tabs in your preferred order
     for zone_name in ["Pacific", "Eastern", "Central", "Mountain"]:
         add_if_present(zone_name)
+
+    # 3) AnyDesk Status tab
+    add_if_present("AnyDesk Status")
 
     # 4) All other date-like tabs (YYYY-MM-DD), newest -> oldest, excluding today's
     daily_tabs = [
@@ -395,6 +395,7 @@ def _reorder_monitoring_tabs_for_today(today_tab_name: str) -> None:
 
 def _process_license(
     api: APIClient,
+    sheets: SheetsClient,
     ws,
     row_counter: int,
     license_data: Dict[str, Any],
@@ -405,9 +406,9 @@ def _process_license(
       - Fetch screenshots.
       - Filter for today's screenshots.
       - Detect black screens and error text.
-      - Record a single row into today's sheet.
+      - Upsert a single row into today's sheet (one row per license per day).
 
-    Returns the updated row_counter.
+    Returns the updated row_counter (used just for logging / stats).
     """
     license_id = str(license_data.get("licenseId", ""))
     license_key = str(license_data.get("licenseKey", ""))
@@ -429,72 +430,69 @@ def _process_license(
     if not is_store_open(store_hours_json, timezone_name):
         return row_counter
 
+    # Last checked in monitoring timezone (e.g. US/Central)
     last_checked = get_last_checked_timestamp()
 
+    # --- Fetch screenshots for this license ---
     screenshots_data = api.get_screenshots(license_id)
     if not screenshots_data:
         row_counter += 1
         logger.warning("No screenshots data for license %s.", license_key)
-        ws.append_row(
-            [
-                license_key,
-                license_id,
-                host_name,
-                dealer_name,
-                timezone_name,
-                "",
-                "",
-                "NO_SCREENSHOTS",
-                "",
-                last_checked,
-            ],
-            value_input_option="USER_ENTERED",
-        )
 
+        values = [
+            license_key,
+            license_id,
+            host_name,
+            dealer_name,
+            timezone_name,
+            "",
+            "",
+            "NO_SCREENSHOTS",
+            "",
+            last_checked,
+        ]
+        # One row per license key in this sheet
+        sheets.upsert_row(ws, key_value=license_key, values=values, key_col=1)
         return row_counter
 
     file_urls = screenshots_data.get("files", [])
     if not file_urls:
         row_counter += 1
         logger.warning("Empty 'files' list in screenshots for license %s.", license_key)
-        ws.append_row(
-            [
-                license_key,
-                license_id,
-                host_name,
-                dealer_name,
-                timezone_name,
-                "",
-                "",
-                "NO_SCREENSHOTS",
-                "",
-                last_checked,
-            ],
-            value_input_option="USER_ENTERED",
-        )
 
+        values = [
+            license_key,
+            license_id,
+            host_name,
+            dealer_name,
+            timezone_name,
+            "",
+            "",
+            "NO_SCREENSHOTS",
+            "",
+            last_checked,
+        ]
+        sheets.upsert_row(ws, key_value=license_key, values=values, key_col=1)
         return row_counter
 
-    # Filter to today's screenshots
+    # --- Filter to today's screenshots ---
     todays_urls = filter_screenshots_for_today(file_urls, timezone_name, license_key)
     if not todays_urls:
         row_counter += 1
-        ws.append_row(
-            [
-                license_key,
-                license_id,
-                host_name,
-                dealer_name,
-                timezone_name,
-                "",
-                "",
-                "NO_SCREENSHOTS",
-                "",
-                last_checked,
-            ],
-            value_input_option="USER_ENTERED",
-        )
 
+        values = [
+            license_key,
+            license_id,
+            host_name,
+            dealer_name,
+            timezone_name,
+            "",
+            "",
+            "NO_SCREENSHOTS",
+            "",
+            last_checked,
+        ]
+        sheets.upsert_row(ws, key_value=license_key, values=values, key_col=1)
         return row_counter
 
     # Choose "latest" screenshot by filename (YYYYMMDDHHMMSS.jpg)
@@ -549,7 +547,7 @@ def _process_license(
     unique_errors = sorted(set(detected_errors))
     error_text = ", ".join(unique_errors)
 
-        # Choose which screenshot URL to display in the sheet.
+    # Choose which screenshot URL to display in the sheet.
     # Default: latest screenshot of the day. If we detect any error text,
     # prefer the screenshot where the first error was seen so the image
     # matches the Detected Error Text.
@@ -559,7 +557,7 @@ def _process_license(
     if error_count >= 1 and error_screenshot_url:
         display_url = error_screenshot_url
         display_ts = _extract_timestamp_from_url(display_url, timezone_name)
-    
+
     # Decide final screenshot status
     if black_screens >= 3:
         screenshot_status = "OPEN_HOURS_BLACK_SCREEN"
@@ -571,21 +569,20 @@ def _process_license(
         screenshot_status = "OK"
 
     row_counter += 1
-    ws.append_row(
-        [
-            license_key,
-            license_id,
-            host_name,
-            dealer_name,
-            timezone_name,
-            display_url,
-            display_ts,
-            screenshot_status,
-            error_text,
-            last_checked,
-        ],
-        value_input_option="USER_ENTERED",
-    )
+
+    values = [
+        license_key,
+        license_id,
+        host_name,
+        dealer_name,
+        timezone_name,
+        display_url,
+        display_ts,
+        screenshot_status,
+        error_text,
+        last_checked,
+    ]
+    sheets.upsert_row(ws, key_value=license_key, values=values, key_col=1)
 
     if screenshot_status != "OK":
         logger.warning(
@@ -631,6 +628,30 @@ def run_screenshot_health() -> None:
 
     sheets.ensure_headers(ws, headers)
 
+    # Make the sheet more readable: wider columns + left alignment.
+    try:
+        # A–J => 1–10, adjust pixel_size if you want wider/narrower.
+        sheets.set_column_widths(ws, start_col=1, end_col=len(headers), pixel_size=200)
+    except Exception as exc:
+        logger.warning(
+            "Failed to set column widths for sheet '%s': %s",
+            sheet_name,
+            exc,
+        )
+
+    try:
+        # Left-align everything in columns A–J
+        sheets.set_horizontal_alignment(ws, start_col=1, end_col=len(headers), horizontal="LEFT")
+    except Exception as exc:
+        logger.warning(
+            "Failed to set alignment for sheet '%s': %s",
+            sheet_name,
+            exc,
+        )
+        
+    # Reorder tabs so today's date sheet + fixed tabs are on the left
+    _reorder_monitoring_tabs_for_today(sheet_name)
+    
     # Start row_counter after existing rows
     existing_values = ws.get_all_values()
     row_counter = max(len(existing_values), 1)
@@ -690,7 +711,7 @@ def run_screenshot_health() -> None:
 
         for lic in licenses:
             try:
-                row_counter = _process_license(api, ws, row_counter, lic)
+                row_counter = _process_license(api, sheets, ws, row_counter, lic)
             except Exception as e:
                 logger.error(
                     "Error while processing license %s: %s",
@@ -700,8 +721,6 @@ def run_screenshot_health() -> None:
                 )
 
         page += 1
-    # Reorder tabs so today's date sheet + fixed tabs are on the left
-    _reorder_monitoring_tabs_for_today(sheet_name)
 
     logger.info("Screenshot health check complete.")
 
