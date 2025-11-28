@@ -98,22 +98,20 @@ class SheetsClient:
     # Row helpers
     # ------------------------------------------------------------------ #
 
-    def find_row_by_value(
-        self,
-        ws,
-        value: Any,
-        col: int = 1,
-    ) -> Optional[int]:
+    def find_row_by_value(self, ws, value, col: int = 1) -> Optional[int]:
         """
-        Find the row index where the given value appears in the given column.
+        Return the row index of the first cell in column `col` that matches `value`.
 
-        Returns:
-            Row index (1-based) if found, otherwise None.
+        Works with both old and new gspread versions. If nothing is found or any
+        lookup error happens, returns None.
         """
         try:
             cell = ws.find(str(value), in_column=col)
-            return cell.row
-        except gspread.exceptions.CellNotFound:
+            return cell.row if cell is not None else None
+        except Exception:
+            # In gspread 6.x there is no CellNotFound anymore; any lookup
+            # failure just bubbles as a generic exception. We treat that
+            # as "not found".
             return None
 
     def upsert_row(
