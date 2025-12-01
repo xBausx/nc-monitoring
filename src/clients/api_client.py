@@ -137,11 +137,32 @@ class APIClient:
         return True
 
     def _ensure_auth(self) -> bool:
-        """Make sure we have a token; if not, try logging in."""
-        if self.token:
+        """
+        Make sure we have a valid auth context.
+
+        Some NC API endpoints (e.g. /api/license/getall) expect an auth cookie
+        on the session in addition to the Bearer token. If we only restore the
+        token from tokens.json and never perform a fresh login(), the session
+        will have no cookies and those endpoints respond with
+        {"message": "cookie is required!"}.
+
+        To keep things robust we treat BOTH token and cookies as required.
+        If either is missing we trigger a fresh login() so the session picks up
+        the token and the cookie again.
+        """
+        has_token = bool(self.token)
+        has_cookies = bool(self.session.cookies)
+
+        if has_token and has_cookies:
             return True
-        logger.info("No token present; attempting login...")
+
+        logger.info(
+            "Auth context incomplete (token=%s, cookies=%s); attempting login...",
+            "yes" if has_token else "no",
+            "yes" if has_cookies else "no",
+        )
         return self.login()
+
 
     # --------------------------------------------------------------------- #
     # Generic request helper

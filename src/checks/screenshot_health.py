@@ -1,6 +1,8 @@
 import logging
 import os
 import re
+import json
+
 from datetime import datetime, time, timedelta
 from io import BytesIO
 from typing import Any, Dict, List, Optional
@@ -9,6 +11,7 @@ from pathlib import Path
 import gspread
 import pytesseract
 import pytz
+import logging
 import requests
 from google.oauth2.service_account import Credentials
 from PIL import Image
@@ -30,6 +33,10 @@ ERROR_MESSAGES = {
     "updates are available",
     "downloading updates",
 }
+
+# Timezone used for naming the daily sheet and the "Last Checked" column.
+# Default is Texas time (US/Central). You can override this with NC_MONITORING_TZ.
+MONITORING_TZ_NAME = os.getenv("NC_MONITORING_TZ", "US/Central")
 
 # Configure pytesseract to use TESSERACT_CMD if provided, or fall back to
 # the repo-local Tesseract-OCR\tesseract.exe path.
@@ -57,98 +64,155 @@ if TESSERACT_CMD:
 
 def get_formatted_date_us_central() -> str:
     """
-    Get the current date formatted as 'YYYY-MM-DD' in US/Central timezone.
-    This is used as the sheet name (same behavior as your old script).
+    Get the current date formatted as 'YYYY-MM-DD' in the monitoring timezone.
+
+    By default this is US/Central (Texas time) so that daily tabs line up with
+    Texas dates even if the script runs on a machine in another timezone.
     """
     try:
-        texas_timezone = pytz.timezone("US/Central")
+        texas_timezone = pytz.timezone(MONITORING_TZ_NAME)
         now_in_texas = datetime.now(texas_timezone)
         formatted_date = now_in_texas.strftime("%Y-%m-%d")
-        logger.info("Formatted date (US/Central): %s", formatted_date)
+        logger.info("Formatted date (%s): %s", MONITORING_TZ_NAME, formatted_date)
         return formatted_date
     except Exception as error:
         logger.error("Error formatting date: %s", error, exc_info=True)
         # Fallback to naive today if something goes wrong
         return datetime.utcnow().strftime("%Y-%m-%d")
 
+def get_last_checked_timestamp() -> str:
+    """
+    Return a 'YYYY-MM-DD HH:MM:SS' string in the monitoring timezone.
+
+    This is used for the 'Last Checked' column so it reflects Texas time
+    (or whatever MONITORING_TZ_NAME is set to), not your local machine time.
+    """
+    try:
+        tz = pytz.timezone(MONITORING_TZ_NAME)
+        now_in_tz = datetime.now(tz)
+        return now_in_tz.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception as error:
+        logger.error(
+            "Error formatting last-checked timestamp: %s",
+            error,
+            exc_info=True,
+        )
+        # As a fallback, still return something sane instead of crashing
+        return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
 
 def is_store_open(store_hours_json: str, timezone_name: str) -> bool:
     """
-    Determine if the store is open right now based on storeHours JSON and timezone.
+    Decide if a store is considered OPEN *right now* based on `storeHours`.
 
-    This is adapted from your old is_store_open implementation, but simplified
-    so it doesn't depend on a global license_key for logging.
+    Supports both formats:
+      1) New format with openingHourData/closingHourData:
+         {
+            "periods": [
+              {
+                "openingHourData": {"hour": 7, "minute": 30, "second": 0},
+                "closingHourData": {"hour": 17, "minute": 0, "second": 0}
+              }
+            ]
+         }
+
+      2) Old format with string times:
+         {
+            "periods": [
+              {"open": "10:00 AM", "close": "6:00 PM"}
+            ]
+         }
+
+    On parse error, we treat the store as CLOSED (return False) to avoid
+    false positives.
     """
     if not store_hours_json:
+        # No store hours – safest is to treat as closed.
         return False
 
+    # Parse the JSON
     try:
-        store_hours = __import__("json").loads(store_hours_json)
-    except __import__("json").JSONDecodeError:
-        logger.error("Invalid storeHours JSON format.")
+        store_hours = json.loads(store_hours_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        logger.warning("Invalid storeHours JSON: %s", exc)
         return False
 
+    # Normalise timezone
     try:
-        store_timezone = pytz.timezone(timezone_name)
-    except pytz.UnknownTimeZoneError:
-        logger.error("Invalid timezone: %s", timezone_name)
-        return False
+        tz = pytz.timezone(timezone_name or "US/Central")
+    except Exception:
+        logger.warning("Unknown timezone '%s', defaulting to US/Central", timezone_name)
+        tz = pytz.timezone("US/Central")
 
-    current_time = datetime.now(store_timezone)
-    current_day_label = current_time.strftime("%A")  # e.g., "Monday"
-    current_time_only = current_time.time().replace(microsecond=0)
+    now = datetime.now(tz)
+    current_time = now.time()
+    current_day_name = now.strftime("%A")  # e.g. "Monday"
 
-    try:
-        for day in store_hours:
-            if day.get("day") != current_day_label:
+    def _parse_period(period: dict) -> Optional[tuple]:
+        """Return (opening_time, closing_time) as datetime.time, or None if unusable."""
+        # New nested format
+        if "openingHourData" in period and "closingHourData" in period:
+            o = period["openingHourData"]
+            c = period["closingHourData"]
+            opening_time = time(
+                hour=o.get("hour", 0),
+                minute=o.get("minute", 0),
+                second=o.get("second", 0),
+            )
+            closing_time = time(
+                hour=c.get("hour", 0),
+                minute=c.get("minute", 0),
+                second=c.get("second", 0),
+            )
+            return opening_time, closing_time
+
+        # Old string format: "open": "10:00 AM", "close": "6:00 PM"
+        open_str = period.get("open")
+        close_str = period.get("close")
+        if not open_str or not close_str:
+            return None
+
+        for fmt in ("%I:%M %p", "%H:%M"):
+            try:
+                o_dt = datetime.strptime(open_str, fmt)
+                c_dt = datetime.strptime(close_str, fmt)
+                return o_dt.time(), c_dt.time()
+            except ValueError:
                 continue
 
-            # If status is false or missing, store is closed
-            if not day.get("status", False):
-                return False
+        logger.warning("Could not parse store hours period: %s", period)
+        return None
 
-            for period in day.get("periods", []):
-                opening_time = time(
-                    hour=period["openingHourData"].get("hour", 0),
-                    minute=period["openingHourData"].get("minute", 0),
-                )
-                closing_time = time(
-                    hour=period["closingHourData"].get("hour", 0),
-                    minute=period["closingHourData"].get("minute", 0),
-                )
+    # store_hours is usually a list of day objects
+    for day in store_hours:
+        # Skip disabled days
+        if not day.get("status", True):
+            continue
 
-                opening_datetime = datetime.combine(current_time.date(), opening_time)
-                opening_datetime = store_timezone.localize(opening_datetime)
+        # Match by day name when present
+        day_name = day.get("day")
+        if day_name and day_name != current_day_name:
+            continue
 
-                # 5-minute grace period after opening: treat as "open but don't check screenshots"
-                five_minutes_after_opening = opening_datetime + timedelta(minutes=5)
-                if opening_datetime <= current_time <= five_minutes_after_opening:
-                    logger.info(
-                        "Store is OPEN but within first 5 minutes after opening. "
-                        "Skipping screenshot check for this run."
-                    )
-                    return False
+        periods = day.get("periods") or []
+        for period in periods:
+            parsed = _parse_period(period)
+            if not parsed:
+                continue
 
-                if opening_time <= closing_time:
-                    # Same-day close
-                    if opening_time <= current_time_only <= closing_time:
-                        logger.info("Store is OPEN.")
-                        return True
-                else:
-                    # Overnight close (crosses midnight)
-                    if current_time_only >= opening_time or current_time_only <= closing_time:
-                        logger.info("Store is OPEN (overnight period).")
-                        return True
+            opening_time, closing_time = parsed
 
-            # No period matched → closed
-            return False
+            if opening_time <= closing_time:
+                # Same-day closing
+                if opening_time <= current_time <= closing_time:
+                    return True
+            else:
+                # Overnight window (e.g. 20:00–02:00)
+                if current_time >= opening_time or current_time <= closing_time:
+                    return True
 
-    except Exception as e:
-        logger.error("Error checking store hours: %s", e)
-
-    # If the day is not found or any error occurs, assume closed
+    # No matching open period found
     return False
-
 
 def is_black_screen(image: Image.Image) -> bool:
     """
@@ -331,6 +395,7 @@ def _reorder_monitoring_tabs_for_today(today_tab_name: str) -> None:
 
 def _process_license(
     api: APIClient,
+    sheets: SheetsClient,
     ws,
     row_counter: int,
     license_data: Dict[str, Any],
@@ -341,55 +406,111 @@ def _process_license(
       - Fetch screenshots.
       - Filter for today's screenshots.
       - Detect black screens and error text.
-      - Log to sheet when something is wrong.
+      - Upsert a single row into today's sheet (one row per license per day).
 
-    Returns the updated row_counter.
+    Returns the updated row_counter (used just for logging / stats).
     """
     license_id = str(license_data.get("licenseId", ""))
     license_key = str(license_data.get("licenseKey", ""))
 
-    store_hours_json = license_data.get("storeHours", "[]")
+    host_name = str(
+        license_data.get("hostName")
+        or license_data.get("businessName")
+        or ""
+    )
+    dealer_name = str(
+        license_data.get("dealerName")
+        or license_data.get("dealerId")
+        or ""
+    )
     timezone_name = license_data.get("timezoneName", "UTC") or "UTC"
+    store_hours_json = license_data.get("storeHours", "[]")
 
-    # Check if store is open; if not, skip
+    # If store is closed, skip logging entirely for this run
     if not is_store_open(store_hours_json, timezone_name):
         return row_counter
 
-    # Fetch screenshots via API
+    # Last checked in monitoring timezone (e.g. US/Central)
+    last_checked = get_last_checked_timestamp()
+
+    # --- Fetch screenshots for this license ---
     screenshots_data = api.get_screenshots(license_id)
     if not screenshots_data:
         row_counter += 1
         logger.warning("No screenshots data for license %s.", license_key)
-        ws.append_row(
-            [row_counter, license_key, "", "NO_SCREENSHOTS"],
-            value_input_option="USER_ENTERED",
-        )
+
+        values = [
+            license_key,
+            license_id,
+            host_name,
+            dealer_name,
+            timezone_name,
+            "",
+            "",
+            "NO_SCREENSHOTS",
+            "",
+            last_checked,
+        ]
+        # One row per license key in this sheet
+        sheets.upsert_row(ws, key_value=license_key, values=values, key_col=1)
         return row_counter
 
     file_urls = screenshots_data.get("files", [])
     if not file_urls:
         row_counter += 1
         logger.warning("Empty 'files' list in screenshots for license %s.", license_key)
-        ws.append_row(
-            [row_counter, license_key, "", "NO_SCREENSHOTS"],
-            value_input_option="USER_ENTERED",
-        )
+
+        values = [
+            license_key,
+            license_id,
+            host_name,
+            dealer_name,
+            timezone_name,
+            "",
+            "",
+            "NO_SCREENSHOTS",
+            "",
+            last_checked,
+        ]
+        sheets.upsert_row(ws, key_value=license_key, values=values, key_col=1)
         return row_counter
 
-    # Filter to today's screenshots
+    # --- Filter to today's screenshots ---
     todays_urls = filter_screenshots_for_today(file_urls, timezone_name, license_key)
     if not todays_urls:
         row_counter += 1
-        ws.append_row(
-            [row_counter, license_key, "", "SCREENSHOT_NAME_DATE_ERROR"],
-            value_input_option="USER_ENTERED",
-        )
+
+        values = [
+            license_key,
+            license_id,
+            host_name,
+            dealer_name,
+            timezone_name,
+            "",
+            "",
+            "NO_SCREENSHOTS",
+            "",
+            last_checked,
+        ]
+        sheets.upsert_row(ws, key_value=license_key, values=values, key_col=1)
         return row_counter
 
-    black_screens = 0
-    error_count = 0
+    # Choose "latest" screenshot by filename (YYYYMMDDHHMMSS.jpg)
+    try:
+        latest_url = max(
+            todays_urls,
+            key=lambda u: u.split("/")[-1],
+        )
+    except ValueError:
+        latest_url = todays_urls[0]
 
-    for url in todays_urls[:4]:  # limit to 4
+    latest_ts = _extract_timestamp_from_url(latest_url, timezone_name)
+
+    black_screens = 0
+    detected_errors: List[str] = []
+    error_screenshot_url: Optional[str] = None  # screenshot where we first saw an error
+
+    for url in todays_urls[:4]:  # limit to first few
         img = load_image_from_url(url)
         if not img:
             continue
@@ -406,7 +527,6 @@ def _process_license(
                 license_key,
                 e,
             )
-            # Can't classify this image, skip to next
             continue
         except Exception as e:
             logger.error(
@@ -416,41 +536,60 @@ def _process_license(
             )
             continue
 
-        if any(err in text for err in ERROR_MESSAGES):
-            error_count += 1
+        for err in ERROR_MESSAGES:
+            if err in text:
+                detected_errors.append(err)
+                # Remember the first screenshot where we saw an error string
+                if error_screenshot_url is None:
+                    error_screenshot_url = url
 
-    # Decide what to log
+    error_count = len(detected_errors)
+    unique_errors = sorted(set(detected_errors))
+    error_text = ", ".join(unique_errors)
+
+    # Choose which screenshot URL to display in the sheet.
+    # Default: latest screenshot of the day. If we detect any error text,
+    # prefer the screenshot where the first error was seen so the image
+    # matches the Detected Error Text.
+    display_url = latest_url
+    display_ts = latest_ts
+
+    if error_count >= 1 and error_screenshot_url:
+        display_url = error_screenshot_url
+        display_ts = _extract_timestamp_from_url(display_url, timezone_name)
+
+    # Decide final screenshot status
     if black_screens >= 3:
-        row_counter += 1
-        ws.append_row(
-            [row_counter, license_key, "", "OPEN_HOURS_BLACK_SCREENSHOTS"],
-            value_input_option="USER_ENTERED",
-        )
-        logger.warning(
-            "Black screen threshold exceeded for license %s (count=%s).",
-            license_key,
-            black_screens,
-        )
+        screenshot_status = "OPEN_HOURS_BLACK_SCREEN"
     elif error_count >= 5:
-        row_counter += 1
-        ws.append_row(
-            [row_counter, license_key, "", "STUCK_ON_ERROR"],
-            value_input_option="USER_ENTERED",
-        )
+        screenshot_status = "STUCK_ON_ERROR"
+    elif error_count >= 1:
+        screenshot_status = "ERROR_DISPLAYED"
+    else:
+        screenshot_status = "OK"
+
+    row_counter += 1
+
+    values = [
+        license_key,
+        license_id,
+        host_name,
+        dealer_name,
+        timezone_name,
+        display_url,
+        display_ts,
+        screenshot_status,
+        error_text,
+        last_checked,
+    ]
+    sheets.upsert_row(ws, key_value=license_key, values=values, key_col=1)
+
+    if screenshot_status != "OK":
         logger.warning(
-            "Error screenshot threshold reached for license %s (count=%s).",
+            "Screenshot issue for license %s: status=%s, black_screens=%s, errors=%s",
             license_key,
-            error_count,
-        )
-    elif 1 <= error_count <= 5:
-        row_counter += 1
-        ws.append_row(
-            [row_counter, license_key, "", "ERROR_DISPLAYED"],
-            value_input_option="USER_ENTERED",
-        )
-        logger.info(
-            "Error screenshots detected for license %s (count=%s).",
-            license_key,
+            screenshot_status,
+            black_screens,
             error_count,
         )
 
@@ -461,10 +600,10 @@ def run_screenshot_health() -> None:
     """
     Main entry point for screenshot health check:
 
-      - Iterate through pages of licenses.
-      - For each license, if store is open, analyze screenshots.
-      - Record issues into a date-based sheet.
-      - Reorder tabs so today's sheet + fixed tabs are on the left.
+        - Iterate through pages of licenses.
+        - For each license, if store is open, analyze screenshots.
+        - Record issues into a date-based sheet.
+        - Reorder tabs so today's sheet + fixed tabs are on the left.
     """
     logger.info("Starting screenshot health check...")
 
@@ -472,10 +611,47 @@ def run_screenshot_health() -> None:
     sheets = SheetsClient()
 
     sheet_name = get_formatted_date_us_central()
-    ws = sheets.get_or_create_worksheet(sheet_name, rows=2000, cols=4)
-    headers = ["Row", "License Key", "URL", "Type"]
+    ws = sheets.get_or_create_worksheet(sheet_name, rows=2000, cols=10)
+
+    headers = [
+        "License Key",
+        "License ID",
+        "Host / Business Name",
+        "Dealer",
+        "Timezone",
+        "Latest Screenshot URL",
+        "Latest Screenshot Timestamp",
+        "Screenshot Status",
+        "Detected Error Text",
+        f"Last Checked ({MONITORING_TZ_NAME})",
+    ]
+
     sheets.ensure_headers(ws, headers)
 
+    # Make the sheet more readable: wider columns + left alignment.
+    try:
+        # A–J => 1–10, adjust pixel_size if you want wider/narrower.
+        sheets.set_column_widths(ws, start_col=1, end_col=len(headers), pixel_size=200)
+    except Exception as exc:
+        logger.warning(
+            "Failed to set column widths for sheet '%s': %s",
+            sheet_name,
+            exc,
+        )
+
+    try:
+        # Left-align everything in columns A–J
+        sheets.set_horizontal_alignment(ws, start_col=1, end_col=len(headers), horizontal="LEFT")
+    except Exception as exc:
+        logger.warning(
+            "Failed to set alignment for sheet '%s': %s",
+            sheet_name,
+            exc,
+        )
+        
+    # Reorder tabs so today's date sheet + fixed tabs are on the left
+    _reorder_monitoring_tabs_for_today(sheet_name)
+    
     # Start row_counter after existing rows
     existing_values = ws.get_all_values()
     row_counter = max(len(existing_values), 1)
@@ -491,17 +667,42 @@ def run_screenshot_health() -> None:
             "sortColumn": "PiStatus",
             "sortOrder": "desc",
             "includeAdmin": "false",
-            "piStatus": 1,   # online
+            # NOTE: We do NOT filter by piStatus here; screenshot health
+            # should consider all active, assigned licenses, regardless of
+            # whether the player is currently online.
             "active": "true",
             "assigned": "true",
         }
 
+        logger.info("Screenshot health: requesting licenses with params=%s", params)
         data = api.get_licenses(params=params)
+
         if not data:
             logger.warning("No data returned for screenshot health on page %s.", page)
             break
 
-        licenses = data.get("licenses", [])
+        if not isinstance(data, dict):
+            logger.warning(
+                "Unexpected data type for screenshot health response on page %s: %s",
+                page,
+                type(data),
+            )
+            break
+
+        logger.info(
+            "Screenshot health: response keys=%s, message=%r",
+            list(data.keys()),
+            data.get("message"),
+        )
+
+        # Try to get licenses from the top level first
+        licenses = data.get("licenses")
+
+        # Some NC endpoints wrap payload like {"message": {...}}
+        message_payload = data.get("message")
+        if licenses is None and isinstance(message_payload, dict):
+            licenses = message_payload.get("licenses")
+
         if not licenses:
             logger.info("No more licenses for screenshot health (page %s).", page)
             break
@@ -510,7 +711,7 @@ def run_screenshot_health() -> None:
 
         for lic in licenses:
             try:
-                row_counter = _process_license(api, ws, row_counter, lic)
+                row_counter = _process_license(api, sheets, ws, row_counter, lic)
             except Exception as e:
                 logger.error(
                     "Error while processing license %s: %s",
@@ -521,7 +722,36 @@ def run_screenshot_health() -> None:
 
         page += 1
 
-    # Reorder tabs so today's date sheet + fixed tabs are on the left
-    _reorder_monitoring_tabs_for_today(sheet_name)
-
     logger.info("Screenshot health check complete.")
+
+def _extract_timestamp_from_url(url: str, timezone_name: str) -> str:
+    """
+    Extract a human-readable timestamp from a screenshot filename of the form
+    YYYYMMDDHHMMSS.jpg (or at least YYYYMMDD).
+
+    Returns an empty string on failure.
+    """
+    try:
+        filename = url.split("/")[-1]
+        name_no_ext = filename.split(".")[0]
+        # Expect at least YYYYMMDD
+        raw = "".join(ch for ch in name_no_ext if ch.isdigit())
+        if len(raw) < 8:
+            return ""
+
+        if len(raw) >= 14:
+            dt = datetime.strptime(raw[:14], "%Y%m%d%H%M%S")
+        else:
+            dt = datetime.strptime(raw[:8], "%Y%m%d")
+
+        try:
+            tz = pytz.timezone(timezone_name or "UTC")
+            if dt.tzinfo is None:
+                dt = tz.localize(dt)
+        except Exception:
+            # If timezone fails, just leave naive
+            pass
+
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""

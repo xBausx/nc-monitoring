@@ -167,7 +167,22 @@ def _ensure_anydesk_worksheet(sheets: SheetsClient):
     Get or create the 'AnyDesk Status' worksheet with proper headers.
     """
     ws = sheets.get_or_create_worksheet("AnyDesk Status", rows=2000, cols=6)
-    headers = ["License ID", "License Key", "AnyDesk ID", "Status", "Last Checked", "Notes"]
+    headers = [
+        "License Key",
+        "License ID",
+        "AnyDesk ID",
+        "Host / Business Name",
+        "Dealer",
+        "Timezone",
+        "PS Version",
+        "UI Version",
+        "Memory",
+        "Storage",
+        "AnyDesk Status",
+        "Last Checked (UTC)",
+        "Notes",
+    ]
+
     sheets.ensure_headers(ws, headers)
     return ws
 
@@ -175,30 +190,68 @@ def _ensure_anydesk_worksheet(sheets: SheetsClient):
 def _update_anydesk_row(
     sheets: Optional[SheetsClient],
     ws,
-    license_id: str,
+    *,
     license_key: str,
+    license_id: str,
     anydesk_id: str,
     status: str,
+    host_name: str,
+    dealer_name: str,
+    timezone_name: str,
+    ps_version: str,
+    ui_version: str,
+    memory: str,
+    storage: str,
+    notes: str = "",
 ) -> None:
     """
-    Append a row in the AnyDesk Status sheet for a given license.
+    Upsert a row in the AnyDesk Status sheet for a given license.
 
-    If `sheets` is None, this is a no-op (we only log to console).
+    Key = License Key (column 1).
+
+    Columns:
+      1  License Key
+      2  License ID
+      3  AnyDesk ID
+      4  Host / Business Name
+      5  Dealer
+      6  Timezone
+      7  PS Version
+      8  UI Version
+      9  Memory
+      10 Storage
+      11 AnyDesk Status
+      12 Last Checked (UTC)
+      13 Notes
     """
     if sheets is None or ws is None:
         return
 
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
     values = [
-        license_id,
         license_key,
+        license_id,
         anydesk_id,
+        host_name,
+        dealer_name,
+        timezone_name,
+        ps_version,
+        ui_version,
+        memory,
+        storage,
         status,
         timestamp,
-        "",
+        notes,
     ]
 
-    ws.append_row(values, value_input_option="USER_ENTERED")
+    # Use upsert so each license has a single row that gets updated each run
+    sheets.upsert_row(
+        ws,
+        key_value=license_key,
+        values=values,
+        key_col=1,  # column 1 = License Key
+    )
 
 
 def _extract_anydesk_info(license_data: Dict[str, Any]) -> Optional[Dict[str, str]]:
@@ -268,7 +321,7 @@ def run_anydesk_check() -> None:
         logger.info("No licenses to process for AnyDesk check.")
         return
 
-    status_counts = {
+    status_counts: Dict[str, int] = {
         "Online": 0,
         "Offline": 0,
         "Wrong Password": 0,
@@ -280,12 +333,53 @@ def run_anydesk_check() -> None:
         license_key = str(lic.get("licenseKey", ""))
         license_id = str(lic.get("licenseId", ""))
 
+        # Extra metadata for the sheet
+        host_name = str(
+            lic.get("hostName")
+            or lic.get("businessName")
+            or ""
+        )
+        dealer_name = str(
+            lic.get("dealerName")
+            or lic.get("dealerId")
+            or ""
+        )
+        timezone_name = str(lic.get("timezoneName") or "")
+        ps_version = str(lic.get("serverVersion", ""))
+        ui_version = str(lic.get("uiVersion", ""))
+        memory = str(lic.get("memory", ""))
+        # Combine total & free storage into a single field
+        total_storage = str(lic.get("totalStorage", ""))
+        free_storage = str(lic.get("freeStorage", ""))
+        storage = (
+            f"{total_storage} (free {free_storage})"
+            if total_storage or free_storage
+            else ""
+        )
+
         info = _extract_anydesk_info(lic)
         if not info:
             status_counts["Skipped"] += 1
             logger.info(
                 "Skipping license %s: missing AnyDesk ID or password.",
                 license_key,
+            )
+            # Still upsert a row with status "Skipped" so it's visible
+            _update_anydesk_row(
+                sheets,
+                ws,
+                license_key=license_key,
+                license_id=license_id,
+                anydesk_id="",
+                status="Skipped",
+                host_name=host_name,
+                dealer_name=dealer_name,
+                timezone_name=timezone_name,
+                ps_version=ps_version,
+                ui_version=ui_version,
+                memory=memory,
+                storage=storage,
+                notes="Missing AnyDesk ID or password",
             )
             continue
 
@@ -311,10 +405,18 @@ def run_anydesk_check() -> None:
         _update_anydesk_row(
             sheets,
             ws,
-            license_id=license_id,
             license_key=license_key,
+            license_id=license_id,
             anydesk_id=anydesk_id,
             status=status,
+            host_name=host_name,
+            dealer_name=dealer_name,
+            timezone_name=timezone_name,
+            ps_version=ps_version,
+            ui_version=ui_version,
+            memory=memory,
+            storage=storage,
+            notes="",
         )
 
     logger.info("AnyDesk connectivity check complete. Summary:")
