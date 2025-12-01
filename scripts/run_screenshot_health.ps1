@@ -1,5 +1,5 @@
-# scripts/run_anydesk_check.ps1
-# Manual AnyDesk Status checker for support.
+# scripts/run_screenshot_health.ps1
+# Scheduled / manual Screenshot Health checker for support.
 
 # --- Repo paths (adjust if needed) ---
 $repoRoot   = "C:\Users\Rico\Documents\nctv-repositories\nc-monitoring"
@@ -7,7 +7,6 @@ $srcDir     = Join-Path $repoRoot "src"
 $scriptsDir = Join-Path $repoRoot "scripts"
 
 # --- Conda initialization + env activation ---
-# This is similar to what `conda init powershell` would inject.
 $condaExe = "C:\Users\Rico\anaconda3\Scripts\conda.exe"  # adjust if Anaconda is elsewhere
 if (Test-Path $condaExe) {
     (& $condaExe "shell.powershell" "hook") | Out-String | Invoke-Expression
@@ -21,18 +20,13 @@ Set-Location $repoRoot
 
 . (Join-Path $scriptsDir "set_monitoring_env.ps1")
 
-# Limit how many licenses per manual run (so it doesn't take forever)
-$env:ANYDESK_MAX_LICENSES_PER_RUN = "10"
-
 # --- Run the check ---
 Set-Location $srcDir
 
 Write-Host ""
-Write-Host "Running AnyDesk connectivity check..." -ForegroundColor Cyan
+Write-Host "Running Screenshot Health check (scheduled)..." -ForegroundColor Cyan
 
-python -c "import logging; logging.basicConfig(level=logging.INFO); from checks.anydesk_check import run_anydesk_check; run_anydesk_check()"
+python -c "import logging; logging.basicConfig(level=logging.INFO); from checks.screenshot_health import run_screenshot_health; run_screenshot_health()"
 
 Write-Host ""
-Write-Host "AnyDesk check finished. You can review the 'AnyDesk Status' sheet now." -ForegroundColor Green
-Write-Host "Press Enter to close this window."
-[void][System.Console]::ReadLine()
+Write-Host "Screenshot health check finished." -ForegroundColor Green
